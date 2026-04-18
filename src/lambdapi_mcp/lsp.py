@@ -22,6 +22,7 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
 
 
 class LSPError(Exception):
@@ -52,11 +53,22 @@ class LSPClient:
         self._pending: dict[int, queue.Queue] = {}
         self._next_id = 1
         self._lock = threading.Lock()
+        self._restart_lock = threading.Lock()
         self._stop = threading.Event()
+        self.restart_count = 0
 
     # --- Process lifecycle --------------------------------------------
 
+    def _reset_state(self) -> None:
+        """Reset in-memory state before a fresh spawn."""
+        self._stderr = []
+        self._notifications = queue.Queue()
+        self._pending = {}
+        self._next_id = 1
+        self._stop = threading.Event()
+
     def start(self) -> None:
+        self._reset_state()
         cmd = [
             self.binary, "lsp",
             "--standard-lsp",
@@ -76,6 +88,24 @@ class LSPClient:
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
         self.initialize()
+
+    def _is_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def _restart(self) -> None:
+        """Kill the (possibly dead) subprocess and start a new one.
+
+        Opened documents are not restored — every tool does did_open at
+        the start of its own request, so restart is safe."""
+        with self._restart_lock:
+            if self._is_alive():
+                return  # another thread already restarted
+            try:
+                self.stop()
+            except Exception:
+                pass
+            self.start()
+            self.restart_count += 1
 
     def stop(self) -> None:
         self._stop.set()
@@ -154,32 +184,68 @@ class LSPClient:
 
     # --- Requests / notifications -------------------------------------
 
-    def request(self, method: str, params: dict | None = None):
+    def _alloc_request(self, method: str, params: dict | None):
+        """Allocate id + reply queue under the lock, return (mid, queue, payload)."""
         with self._lock:
             mid = self._next_id
             self._next_id += 1
             reply: queue.Queue = queue.Queue(maxsize=1)
             self._pending[mid] = reply
-        self._write({
+        payload = {
             "jsonrpc": "2.0", "id": mid,
             "method": method, "params": params or {},
-        })
+        }
+        return mid, reply, payload
+
+    def request(self, method: str, params: dict | None = None):
+        if not self._is_alive():
+            self._restart()
+        mid, reply, payload = self._alloc_request(method, params)
         try:
-            msg = reply.get(timeout=self.timeout)
-        except queue.Empty:
-            raise LSPError(
-                f"timeout waiting for {method} (id={mid}); "
-                f"stderr tail: {self._stderr[-5:]}"
-            )
+            self._write(payload)
+        except (BrokenPipeError, OSError):
+            # Send failed; the old `mid` and its reply queue were wiped
+            # by _restart (via _reset_state), so re-allocate and retry.
+            self._restart()
+            mid, reply, payload = self._alloc_request(method, params)
+            self._write(payload)
+        # Poll the reply queue in short slices so we can notice a dead
+        # subprocess well before [self.timeout] elapses.
+        deadline = time.monotonic() + self.timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._pending.pop(mid, None)
+                raise LSPError(
+                    f"timeout waiting for {method} (id={mid}); "
+                    f"stderr tail: {self._stderr[-5:]}"
+                )
+            try:
+                msg = reply.get(timeout=min(0.5, remaining))
+                break
+            except queue.Empty:
+                if not self._is_alive():
+                    self._pending.pop(mid, None)
+                    raise LSPError(
+                        f"{method}: lambdapi lsp died while waiting "
+                        f"(stderr tail: {self._stderr[-5:]})"
+                    )
         if "error" in msg:
             raise LSPError(f"{method}: {msg['error']}")
         return msg.get("result")
 
     def notify(self, method: str, params: dict | None = None) -> None:
-        self._write({
+        if not self._is_alive():
+            self._restart()
+        payload = {
             "jsonrpc": "2.0",
             "method": method, "params": params or {},
-        })
+        }
+        try:
+            self._write(payload)
+        except (BrokenPipeError, OSError):
+            self._restart()
+            self._write(payload)
 
     def drain_notifications(self, timeout: float = 3.0) -> list[dict]:
         """Collect notifications until [timeout] seconds of silence."""

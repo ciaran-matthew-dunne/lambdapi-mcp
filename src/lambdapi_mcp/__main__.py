@@ -31,12 +31,17 @@ def main(argv: list[str] | None = None) -> int:
         "--binary",
         help="Override the path to the `lambdapi` binary.",
     )
+    p.add_argument(
+        "--log-file",
+        help="Forward `--log-file PATH` to `lambdapi lsp` for debugging.",
+    )
     args = p.parse_args(argv)
 
     server = build_server(
         lib_root=args.lib_root,
         stdlib=args.stdlib,
         binary=args.binary,
+        log_file=args.log_file,
     )
     server.run()
     return 0

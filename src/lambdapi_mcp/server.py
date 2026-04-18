@@ -19,6 +19,7 @@ def build_server(
     lib_root: str | None = None,
     stdlib: str | None = None,
     binary: str | None = None,
+    log_file: str | None = None,
 ) -> FastMCP:
     lib_root = lib_root or default_lib_root()
     map_dirs: list[str] = []
@@ -32,7 +33,12 @@ def build_server(
         if os.path.isdir(default):
             map_dirs.append(f"Stdlib:{default}")
 
-    lsp = LSPClient(lib_root=lib_root, map_dirs=map_dirs, binary=binary)
+    lsp = LSPClient(
+        lib_root=lib_root,
+        map_dirs=map_dirs,
+        binary=binary,
+        log_file=log_file,
+    )
     lsp.start()
 
     mcp = FastMCP("lambdapi-mcp")
@@ -59,10 +65,17 @@ def build_server(
         return T.tool_query(lsp, file, line, query)
 
     @mcp.tool(
-        description="Try a tactic at a line without modifying the file. "
-                    "mode='insert' (default) prepends the tactic; "
-                    "mode='replace' overwrites the line, useful when the "
-                    "tactic introduces a name that would clash."
+        description=(
+            "Try a tactic at a line without modifying the file on disk. "
+            "mode='insert' (default) inserts the tactic before [line]; "
+            "mode='replace' overwrites [line], useful when the tactic "
+            "introduces a name that would clash. "
+            "Returns pre_goals/post_goals plus three booleans: "
+            "ok (no error diagnostic on the probe line), "
+            "closed (pre-state had ≥1 goal and post-state has 0 — the "
+            "tactic finished the proof obligation), and "
+            "progress (the goal state changed)."
+        )
     )
     def lambdapi_try(
         file: str, line: int, tactic: str, mode: str = "insert"
@@ -70,9 +83,11 @@ def build_server(
         return T.tool_try(lsp, file, line, tactic, mode=mode)
 
     @mcp.tool(
-        description="Try multiple tactics at the same line in parallel. "
-                    "Returns a list of per-tactic outcomes (same shape as "
-                    "lambdapi_try)."
+        description=(
+            "Try multiple tactics at the same line in parallel. Returns "
+            "a list of per-tactic outcomes (same shape as lambdapi_try, "
+            "including ok/closed/progress)."
+        )
     )
     def lambdapi_multi_try(
         file: str, line: int, tactics: list[str], mode: str = "insert"
@@ -87,8 +102,17 @@ def build_server(
         return T.tool_symbols(lsp, file)
 
     @mcp.tool(
-        description="Scan files for unproved assumptions — axioms, "
-                    "postulates, and admits."
+        description=(
+            "Scan files — and everything they transitively `require` — "
+            "for unproved assumptions. Returns three lists: "
+            "`assumptions` (any `symbol` / `constant symbol` without a "
+            "`≔` body; each carries `type`, `propositional`, "
+            "`constant`), `rewrite_rules` (every `rule LHS ↪ RHS` "
+            "including sub-rules of `with`-chained blocks; each carries "
+            "`symbol`, `lhs`, `rhs`), and `admits` (`admit;` holes in "
+            "proofs). Also includes `scanned_files` and "
+            "`unresolved_imports`."
+        )
     )
     def lambdapi_axioms(files: list[str]) -> dict:
         return T.tool_axioms(lsp, files)
