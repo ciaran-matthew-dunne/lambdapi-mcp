@@ -1,22 +1,16 @@
 """Pre/post goal consistency and the closed/progress flags for try."""
 
-import pytest
+import pathlib
 
 from lambdapi_mcp import tools
 
 
-def _skip_no_stdlib(stdlib):
-    if not stdlib:
-        pytest.skip("Stdlib required")
-
-
 def test_try_pre_goals_are_populated_for_closing_tactic(
-    lsp, fixture_path, stdlib
+    lsp, fixture_path, require_stdlib
 ):
     """Regression: `reflexivity` used to report pre_goals=[] because the
     LSP was queried after the closing tactic had already collapsed the
     proof state. Pre-state must reflect the goal *before* the tactic."""
-    _skip_no_stdlib(stdlib)
     r = tools.tool_try(
         lsp, fixture_path("proof.lp"),
         line=5, tactic="reflexivity", mode="replace",
@@ -30,23 +24,19 @@ def test_try_pre_goals_are_populated_for_closing_tactic(
     assert r["progress"] is True
 
 
-def test_try_symmetry_no_progress_flagged(lsp, fixture_path, stdlib):
-    """`symmetry` on `π (0 = 0)` leaves the state unchanged — must be
-    reflected in progress=False."""
-    _skip_no_stdlib(stdlib)
+def test_try_symmetry_no_progress_flagged(lsp, fixture_path, require_stdlib):
+    """`symmetry` on `π (0 = 0)` leaves the state unchanged — progress
+    must be False."""
     r = tools.tool_try(
         lsp, fixture_path("proof.lp"),
         line=5, tactic="symmetry", mode="replace",
     )
     assert r["ok"] is True
-    assert r["progress"] is False, (
-        "symmetry on `0 = 0` swaps sides but does not change the goal"
-    )
+    assert r["progress"] is False
     assert r["closed"] is False
 
 
-def test_try_closed_flag_false_on_error(lsp, fixture_path, stdlib):
-    _skip_no_stdlib(stdlib)
+def test_try_closed_flag_false_on_error(lsp, fixture_path, require_stdlib):
     r = tools.tool_try(
         lsp, fixture_path("proof.lp"),
         line=5, tactic="apply nonexistent_symbol", mode="replace",
@@ -56,9 +46,7 @@ def test_try_closed_flag_false_on_error(lsp, fixture_path, stdlib):
     assert r["progress"] is False
 
 
-def test_try_does_not_touch_file_on_disk(lsp, fixture_path, stdlib):
-    _skip_no_stdlib(stdlib)
-    import pathlib
+def test_try_does_not_touch_file_on_disk(lsp, fixture_path, require_stdlib):
     path = pathlib.Path(fixture_path("proof.lp"))
     before = path.read_bytes()
     tools.tool_try(lsp, str(path), line=5, tactic="reflexivity")

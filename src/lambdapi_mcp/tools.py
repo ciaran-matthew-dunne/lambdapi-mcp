@@ -47,6 +47,37 @@ def _check_line(text: str, line: int) -> dict | None:
     return None
 
 
+def _require_position(
+    file: str, line: int | None = None, character: int | None = None
+) -> tuple[str | None, dict | None]:
+    """Validate file exists + (optional) line / character arguments.
+
+    Returns ``(text, None)`` on success, or ``(None, error_dict)`` with
+    the file/line/character fields filled in for caller convenience.
+    The single entry point for the three-or-four-way checks every
+    position-taking tool used to inline."""
+    err = _check_file(file)
+    if err:
+        return None, err
+    text = _read(file)
+    if line is not None:
+        err = _check_line(text, line)
+        if err:
+            err["file"] = file
+            err["line"] = line
+            if character is not None:
+                err["character"] = character
+            return None, err
+    if character is not None and (
+        not isinstance(character, int) or character < 0
+    ):
+        return None, {
+            "ok": False, "file": file, "line": line,
+            "error": f"character {character} must be a non-negative int",
+        }
+    return text, None
+
+
 def _split_lines(text: str) -> list[str]:
     return text.split("\n")
 
@@ -93,27 +124,19 @@ def _format_err(d: dict) -> dict:
 
 
 def tool_check(client: LSPClient, file: str) -> dict:
-    """Type-check a .lp file. Returns OK or the first error."""
-    err = _check_file(file)
+    """Type-check a .lp file. Returns OK or the sorted list of errors."""
+    text, err = _require_position(file)
     if err:
         return err
     uri = file_uri(file)
-    text = _read(file)
-    client.did_open(uri, text)
-    try:
-        diags = client.latest_diagnostics(
-            client.drain_notifications(timeout=5.0), uri=uri
-        )
-    finally:
-        client.did_close(uri)
+    with client.open_doc(uri, text) as session:
+        diags = session.diagnostics
     errs = _errors(diags)
     if not errs:
         return {"ok": True, "file": file}
-    errs.sort(
-        key=lambda d: (
-            d["range"]["start"]["line"], d["range"]["start"]["character"]
-        )
-    )
+    errs.sort(key=lambda d: (
+        d["range"]["start"]["line"], d["range"]["start"]["character"]
+    ))
     return {"ok": False, "file": file, "errors": [_format_err(d) for d in errs]}
 
 
@@ -122,23 +145,13 @@ def tool_check(client: LSPClient, file: str) -> dict:
 
 def tool_goals(client: LSPClient, file: str, line: int) -> dict:
     """Return the proof state (hyps + goals) at 1-based [line]."""
-    err = _check_file(file)
+    text, err = _require_position(file, line)
     if err:
-        return err
-    text = _read(file)
-    err = _check_line(text, line)
-    if err:
-        err["file"] = file
-        err["line"] = line
         return err
     uri = file_uri(file)
-    client.did_open(uri, text)
-    try:
-        client.drain_notifications(timeout=5.0)
+    with client.open_doc(uri, text):
         # proof/goals uses 0-based lines; column 0 is fine.
         result = client.goals(uri, line=line - 1, character=0)
-    finally:
-        client.did_close(uri)
     return {"file": file, "line": line, "state": result or {"goals": []}}
 
 
@@ -160,54 +173,57 @@ def tool_query(
             "error": f"unknown query verb {verb!r}; "
                      f"expected one of {sorted(_QUERY_VERBS)}",
         }
-    err = _check_file(file)
+    text, err = _require_position(file, line)
     if err:
         return err
-    text = _read(file)
-    err = _check_line(text, line)
-    if err:
-        err["file"] = file
-        err["line"] = line
-        return err
-    probe = _ensure_semicolon(query)
-    modified = _insert_at(text, line, probe)
+    modified = _insert_at(text, line, _ensure_semicolon(query))
     uri = file_uri(file)
-    client.did_open(uri, modified)
-    try:
-        # The LSP emits query output through window/logMessage and
-        # through the OK-hint diagnostic's message field. Capture both.
-        notifs = client.drain_notifications(timeout=5.0)
-        diags = client.latest_diagnostics(notifs, uri=uri)
-    finally:
-        client.did_close(uri)
+    # Query output comes back through window/logMessage notifications
+    # and the OK-hint (severity=4) diagnostic's message field — capture
+    # both via the session.
+    with client.open_doc(uri, modified) as session:
+        pass
+    diags = session.diagnostics
     errs = _errors(diags)
     if errs:
         return {"ok": False, "error": errs[0]["message"]}
-    # The probe line is at [line] (1-based). Pick the OK-hint whose
-    # range.start.line matches line-1 (0-based).
-    target = line - 1
-    hints = [
-        d for d in diags
+    target = line - 1  # 0-based probe line
+    output = "\n".join(
+        d["message"] for d in diags
         if d.get("severity") == 4
         and d["range"]["start"]["line"] == target
-    ]
-    output = "\n".join(d["message"] for d in hints) or ""
-    # Gather any window/logMessage notifications as additional output.
+    )
     logs = [
         m["params"].get("message", "")
-        for m in notifs if m.get("method") == "window/logMessage"
+        for m in session.notifications
+        if m.get("method") == "window/logMessage"
     ]
     return {
-        "ok": True,
-        "file": file,
-        "line": line,
-        "query": query,
-        "output": output,
-        "logs": logs,
+        "ok": True, "file": file, "line": line, "query": query,
+        "output": output, "logs": logs,
     }
 
 
 # --- lambdapi_try -----------------------------------------------------
+
+
+def _goals_key(goals: list[dict]) -> list[tuple]:
+    """A gid-free, hashable summary of a goal list, for progress checks.
+
+    The LSP assigns fresh goal ids on every didOpen, so `gid` differs
+    between our pre- and post- probes even when the tactic made no
+    change. Compare on (typeofgoal, type, normalised hyps) instead."""
+    return [
+        (
+            g.get("typeofgoal", ""),
+            g.get("type", ""),
+            tuple(
+                (h.get("hname", ""), h.get("htype", ""))
+                for h in g.get("hyps", []) or []
+            ),
+        )
+        for g in goals
+    ]
 
 
 def tool_try(
@@ -231,14 +247,8 @@ def tool_try(
         return {"ok": False, "error": f"bad mode {mode!r}"}
     if not isinstance(tactic, str) or not tactic.strip():
         return {"ok": False, "error": "tactic: expected non-empty string"}
-    err = _check_file(file)
+    text, err = _require_position(file, line)
     if err:
-        return err
-    text = _read(file)
-    err = _check_line(text, line)
-    if err:
-        err["file"] = file
-        err["line"] = line
         return err
     probe = _ensure_semicolon(tactic)
     if mode == "insert":
@@ -247,76 +257,44 @@ def tool_try(
     else:
         modified, original_line = _replace_line(text, line, probe)
     probe_line_0 = line - 1
-
     uri = file_uri(file)
 
-    # 1. Capture the pre-state from the UNMODIFIED document. The LSP's
-    # reply at (probe_line_0, 0) would otherwise depend on whether the
-    # probed tactic closed the proof — inserting `reflexivity` at a
-    # closed-goal row, for example, makes the LSP return an empty
-    # "pre-state". Querying the unmodified text sidesteps that.
-    client.did_open(uri, text)
-    try:
-        client.drain_notifications(timeout=5.0)
+    # Capture pre-state from the UNMODIFIED document. The LSP's reply at
+    # (probe_line_0, 0) would otherwise depend on whether the probed
+    # tactic closed the proof (e.g. inserting `reflexivity` on a closed-
+    # goal row returns an empty pre-state). Querying the unmodified text
+    # sidesteps that.
+    with client.open_doc(uri, text):
         pre = client.goals(uri, line=probe_line_0, character=0) or {}
-    finally:
-        client.did_close(uri)
 
-    # 2. Now probe the modified document for post-state + diagnostics.
-    client.did_open(uri, modified)
-    try:
-        diags = client.latest_diagnostics(
-            client.drain_notifications(timeout=5.0), uri=uri
-        )
+    # Probe the modified document for post-state + diagnostics.
+    with client.open_doc(uri, modified) as session:
         post = client.goals(uri, line=probe_line_0 + 1, character=0) or {}
-    finally:
-        client.did_close(uri)
 
     errs_at_probe = [
-        d for d in _errors(diags)
+        d for d in _errors(session.diagnostics)
         if d["range"]["start"]["line"] == probe_line_0
     ]
     pre_goals = pre.get("goals", []) or []
     post_goals = post.get("goals", []) or []
     result = {
-        "file": file,
-        "line": line,
-        "tactic": tactic,
-        "mode": mode,
-        "pre_goals": pre_goals,
-        "post_goals": post_goals,
+        "file": file, "line": line, "tactic": tactic, "mode": mode,
+        "pre_goals": pre_goals, "post_goals": post_goals,
     }
     if mode == "replace":
         result["replaced_line"] = original_line
     if errs_at_probe:
-        result["ok"] = False
-        result["closed"] = False
-        result["progress"] = False
-        result["error"] = errs_at_probe[0]["message"]
-    else:
-        result["ok"] = True
-        result["closed"] = bool(pre_goals) and not post_goals
-        result["progress"] = _goals_key(pre_goals) != _goals_key(post_goals)
-    return result
-
-
-def _goals_key(goals: list[dict]) -> list[tuple]:
-    """A gid-free, hashable summary of a goal list, for progress checks.
-
-    The LSP assigns fresh goal ids on every didOpen, so `gid` differs
-    between our pre- and post- probes even when the tactic made no
-    change. Compare on (typeofgoal, type, normalised hyps) instead."""
-    return [
-        (
-            g.get("typeofgoal", ""),
-            g.get("type", ""),
-            tuple(
-                (h.get("hname", ""), h.get("htype", ""))
-                for h in g.get("hyps", []) or []
-            ),
+        result.update(
+            ok=False, closed=False, progress=False,
+            error=errs_at_probe[0]["message"],
         )
-        for g in goals
-    ]
+    else:
+        result.update(
+            ok=True,
+            closed=bool(pre_goals) and not post_goals,
+            progress=_goals_key(pre_goals) != _goals_key(post_goals),
+        )
+    return result
 
 
 # --- lambdapi_multi_try ----------------------------------------------
@@ -379,25 +357,19 @@ def tool_symbols(client: LSPClient, file: str) -> dict:
     attributed to the queried URI. We cross-check each reported symbol's
     name against a local declaration parse of [file] and drop anything
     that isn't actually declared in this file."""
-    err = _check_file(file)
+    text, err = _require_position(file)
     if err:
         return err
     uri = file_uri(file)
-    text = _read(file)
     local_names = _local_decl_names(text)
-    client.did_open(uri, text)
-    try:
-        client.drain_notifications(timeout=5.0)
+    with client.open_doc(uri, text):
         result = client.document_symbol(uri) or []
-    finally:
-        client.did_close(uri)
     symbols = []
     for s in result:
         name = s.get("name", "")
         if name not in local_names:
             continue
-        loc = s.get("location", {})
-        rng = loc.get("range", {}).get("start", {})
+        rng = s.get("location", {}).get("range", {}).get("start", {})
         symbols.append({
             "name": name,
             "kind": s.get("kind"),
@@ -537,6 +509,15 @@ _RULE_STMT_RE = re.compile(r"^\s*rule\b(.+)$", re.DOTALL)
 _RULE_HEAD_RE = re.compile(r"^\s*([^\s\(\[]+)")
 
 
+def _is_propositional(type_str: str) -> bool:
+    """A type is propositional iff it eventually applies ``π`` to a Prop
+    (i.e. ``π …`` somewhere at the top level after quantifiers). We
+    approximate: a leading token ``π`` or ``Π …, π`` counts."""
+    if type_str.lstrip().startswith("π"):
+        return True
+    return bool(re.search(r"(?:^|\s|,)π[\s(]", type_str))
+
+
 def _parse_rewrite_rules(body: str) -> list[tuple[str, str, str]]:
     """Split a `rule …[with …]*` body into ``(head, lhs, rhs)`` triples.
 
@@ -615,18 +596,6 @@ def _scan_assumptions(
         if _ADMIT_RE.match(line):
             admits.append({"file": f, "line": i})
     return assumptions, rewrite_rules, admits
-
-
-def _is_propositional(type_str: str) -> bool:
-    """A type is propositional iff it eventually applies ``π`` to a Prop
-    (i.e. ``π …`` somewhere at the top level after quantifiers). We
-    approximate: a leading token ``π`` or ``Π …, π`` counts."""
-    s = type_str.lstrip()
-    if s.startswith("π"):
-        return True
-    # `Π x:A, π B` — a dependent function returning a proposition.
-    # Also handles `∀`-sugar forms.
-    return bool(re.search(r"(?:^|\s|,)π[\s(]", type_str))
 
 
 def tool_axioms(client: LSPClient, files: list[str]) -> dict:
@@ -730,29 +699,15 @@ def tool_axioms(client: LSPClient, files: list[str]) -> dict:
 
 def tool_hover(client: LSPClient, file: str, line: int, character: int) -> dict:
     """Return hover information at (1-based [line], 0-based [character])."""
-    err = _check_file(file)
+    text, err = _require_position(file, line, character)
     if err:
         return err
-    text = _read(file)
-    err = _check_line(text, line)
-    if err:
-        err["file"] = file
-        err["line"] = line
-        err["character"] = character
-        return err
-    if not isinstance(character, int) or character < 0:
-        return {"ok": False, "file": file, "line": line,
-                "error": f"character {character} must be a non-negative int"}
     uri = file_uri(file)
-    client.did_open(uri, text)
-    try:
-        client.drain_notifications(timeout=5.0)
+    with client.open_doc(uri, text):
         result = client.hover(uri, line=line - 1, character=character)
-    finally:
-        client.did_close(uri)
+    pos = {"file": file, "line": line, "character": character}
     if result is None:
-        return {"file": file, "line": line, "character": character,
-                "found": False}
+        return {**pos, "found": False}
     contents = result.get("contents")
     if isinstance(contents, dict):
         text_content = contents.get("value", "")
@@ -763,11 +718,7 @@ def tool_hover(client: LSPClient, file: str, line: int, character: int) -> dict:
         )
     else:
         text_content = str(contents or "")
-    return {
-        "file": file, "line": line, "character": character,
-        "found": True,
-        "contents": text_content,
-    }
+    return {**pos, "found": True, "contents": text_content}
 
 
 # --- lambdapi_declaration --------------------------------------------
@@ -778,31 +729,15 @@ def tool_declaration(
 ) -> dict:
     """Return the declaration location of the symbol at the given
     position, via textDocument/definition."""
-    err = _check_file(file)
+    text, err = _require_position(file, line, character)
     if err:
         return err
-    text = _read(file)
-    err = _check_line(text, line)
-    if err:
-        err["file"] = file
-        err["line"] = line
-        err["character"] = character
-        return err
-    if not isinstance(character, int) or character < 0:
-        return {"ok": False, "file": file, "line": line,
-                "error": f"character {character} must be a non-negative int"}
     uri = file_uri(file)
-    client.did_open(uri, text)
-    try:
-        client.drain_notifications(timeout=5.0)
+    with client.open_doc(uri, text):
         result = client.definition(uri, line=line - 1, character=character)
-    finally:
-        client.did_close(uri)
-    loc = None
-    if isinstance(result, dict):
-        loc = result
-    elif isinstance(result, list) and result:
-        loc = result[0]
+    loc = result if isinstance(result, dict) else (
+        result[0] if isinstance(result, list) and result else None
+    )
     if loc is None:
         return {"file": file, "line": line, "character": character,
                 "found": False}
@@ -810,8 +745,7 @@ def tool_declaration(
     rng = loc.get("range", {}).get("start", {})
     return {
         "found": True,
-        "file": target_uri[7:] if target_uri.startswith("file://")
-                else target_uri,
+        "file": target_uri[7:] if target_uri.startswith("file://") else target_uri,
         "line": rng.get("line", 0) + 1,
         "character": rng.get("character", 0),
     }
@@ -827,23 +761,11 @@ def tool_completions(
 
     Requires the server to advertise ``completionProvider`` — available
     when ``lambdapi lsp`` is on a branch with the completion patch."""
-    err = _check_file(file)
+    text, err = _require_position(file, line, character)
     if err:
         return err
-    text = _read(file)
-    err = _check_line(text, line)
-    if err:
-        err["file"] = file
-        err["line"] = line
-        err["character"] = character
-        return err
-    if not isinstance(character, int) or character < 0:
-        return {"ok": False, "file": file, "line": line,
-                "error": f"character {character} must be a non-negative int"}
     uri = file_uri(file)
-    client.did_open(uri, text)
-    try:
-        client.drain_notifications(timeout=5.0)
+    with client.open_doc(uri, text):
         try:
             result = client.request("textDocument/completion", {
                 "textDocument": {"uri": uri},
@@ -851,18 +773,12 @@ def tool_completions(
             })
         except LSPError as e:
             return {"file": file, "supported": False, "error": str(e)}
-    finally:
-        client.did_close(uri)
     items = (result or {}).get("items", []) if isinstance(result, dict) else []
     return {
-        "file": file,
-        "supported": True,
+        "file": file, "supported": True,
         "items": [
-            {
-                "label": i.get("label", ""),
-                "kind": i.get("kind"),
-                "detail": i.get("detail", ""),
-            }
+            {"label": i.get("label", ""), "kind": i.get("kind"),
+             "detail": i.get("detail", "")}
             for i in items
         ],
     }

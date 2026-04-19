@@ -16,6 +16,7 @@ session, so we don't need concurrent request handling.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -27,6 +28,22 @@ import time
 
 class LSPError(Exception):
     """Raised when the server returns an error, times out, or crashes."""
+
+
+class _DocSession:
+    """State for one ``open_doc`` context: the drained notifications
+    from the did_open cycle, plus a convenience view on diagnostics."""
+
+    def __init__(self, client: "LSPClient", uri: str) -> None:
+        self._client = client
+        self._uri = uri
+        self.notifications: list[dict] = []
+
+    @property
+    def diagnostics(self) -> list[dict]:
+        return self._client.latest_diagnostics(
+            self.notifications, uri=self._uri
+        )
 
 
 class LSPClient:
@@ -261,11 +278,8 @@ class LSPClient:
 
     # --- High-level helpers ------------------------------------------
 
-    def initialize(self, root_uri: str | None = None) -> dict | None:
-        params: dict = {"capabilities": {}}
-        if root_uri is not None:
-            params["rootUri"] = root_uri
-        result = self.request("initialize", params)
+    def initialize(self) -> dict | None:
+        result = self.request("initialize", {"capabilities": {}})
         self.notify("initialized", {})
         return result
 
@@ -283,14 +297,26 @@ class LSPClient:
             },
         })
 
-    def did_change(self, uri: str, text: str, version: int) -> None:
-        self.notify("textDocument/didChange", {
-            "textDocument": {"uri": uri, "version": version},
-            "contentChanges": [{"text": text}],
-        })
-
     def did_close(self, uri: str) -> None:
         self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    @contextlib.contextmanager
+    def open_doc(self, uri: str, text: str, drain_timeout: float = 5.0):
+        """Context manager: did_open → drain diagnostics → yield a
+        ``DocSession`` (so ``session.diagnostics`` / ``.notifications``
+        are available inside or after the block) → did_close on exit.
+
+        Replaces the did_open / try / drain / did_close boilerplate every
+        position-taking tool needs."""
+        self.did_open(uri, text)
+        session = _DocSession(self, uri)
+        try:
+            session.notifications = self.drain_notifications(
+                timeout=drain_timeout
+            )
+            yield session
+        finally:
+            self.did_close(uri)
 
     def hover(self, uri: str, line: int, character: int):
         return self.request("textDocument/hover", {

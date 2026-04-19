@@ -71,3 +71,11 @@ def fixture_path(lib_root: pathlib.Path):
     def _get(name: str) -> str:
         return str(lib_root / name)
     return _get
+
+
+@pytest.fixture
+def require_stdlib(stdlib):
+    """Autoskip if the opam-installed Stdlib is missing. Depend on this
+    fixture in tests that need `Stdlib.*` imports to resolve."""
+    if not stdlib:
+        pytest.skip("Stdlib required")
